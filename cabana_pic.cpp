@@ -1,9 +1,12 @@
 //Include Cabana Header and Kokkos headers
+#include <fenv.h>
+
 
 #include <Cabana_Core.hpp>
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Random.hpp>
+#include <Kokkos_ScatterView.hpp>
 
 #include <iostream>
 
@@ -18,6 +21,19 @@
 #include "hdf5.h"
 #include "mpi.h"
 
+
+#include <stdlib.h>
+#include <signal.h>
+
+//#define CABANA_MPI
+
+void term_handler(int sig){
+    // Restore the default SIGABRT disposition
+    signal(SIGABRT, SIG_DFL);
+    // Abort (dumps core)
+    abort();
+}
+
 const double c = 299792458.00000000;
 const double epsilon0 = 8.854187817620389850536563031710750e-12;
 
@@ -27,7 +43,8 @@ enum FieldNames{ id = 0,
                  charge,
                  part_pos,
                  part_p,
-                 rank
+                 rank,
+                 last_pos
                };
 
 //Setting default Memory/Host/Execution spaces
@@ -37,11 +54,12 @@ using ExecutionSpace = Kokkos::DefaultExecutionSpace; /*Kokkos::Serial;*/
 using DeviceType = Kokkos::Device<Kokkos::DefaultExecutionSpace, MemorySpace/*ExecutionSpace, MemorySpace*/>;
 using HostType = Kokkos::Device<Kokkos::Serial, Kokkos::HostSpace>;
 using field_type = Kokkos::View<double* , MemorySpace>;
+using scatter_field_type = Kokkos::Experimental::ScatterView<double*>;
 using host_mirror_type = field_type::HostMirror;
 //Types used in the tuple (corresponds to the enum before)
 using DataTypes = Cabana::MemberTypes<int64_t, double, double,
                                       double, double[3], double[3],
-                                      int>;
+                                      int, double[3]>;
 //Declare vector length of SoAs
 const int VectorLength = 16;
 
@@ -55,6 +73,8 @@ struct field{
     double cfl;
     double x_grid_min_local;
     double x_grid_max_local;
+    double x_min_local;
+    double x_max_local;
 };
 
 using field_struct_type = Kokkos::View<struct field*, MemorySpace>;
@@ -71,6 +91,9 @@ struct config_type{
     field_type jx;
     field_type jy;
     field_type jz;
+    scatter_field_type scatter_jx;
+    scatter_field_type scatter_jy;
+    scatter_field_type scatter_jz;
 };
 
 struct boundary{
@@ -107,8 +130,8 @@ void field_bc_mpi(field_type field, int nx, int ng){
 
     MPI_Request send_bottom_request, recv_bottom_request;
     MPI_Request send_top_request, recv_top_request;
-    MPI_Isend( &(field.data()[0]), ng, MPI_DOUBLE, previous_rank, 1, MPI_COMM_WORLD, &send_bottom_request); //Send bottom
-    MPI_Isend( &(field.data()[nx+ng]), ng, MPI_DOUBLE, next_rank, 2, MPI_COMM_WORLD, &send_top_request); //Send top
+    MPI_Isend( &(field.data()[ng]), ng, MPI_DOUBLE, previous_rank, 1, MPI_COMM_WORLD, &send_bottom_request); //Send bottom
+    MPI_Isend( &(field.data()[nx]), ng, MPI_DOUBLE, next_rank, 2, MPI_COMM_WORLD, &send_top_request); //Send top
     MPI_Irecv( top, ng, MPI_DOUBLE, next_rank, 1, MPI_COMM_WORLD, &recv_top_request); //Recv top
     MPI_Irecv( bottom, ng, MPI_DOUBLE, previous_rank, 2, MPI_COMM_WORLD, &recv_bottom_request); //Recv bottom
 
@@ -216,7 +239,7 @@ void processor_summation_boundaries_mpi(field_type field, int nx, int ng){
 
     for(int i = 0; i < ng; i++){
         field(nx+i) += top[i];
-        field(nx+ng-1-i) += bottom[ng-1-i];
+        field(ng+i) += bottom[i];
     }
     free(bottom);
     free(top);
@@ -371,6 +394,7 @@ struct update_b_field_functor{
             cx1 = _config.field(0).hdtx;
             int p1 = ix+1;
             _config.by(ix) = _config.by(ix) + cx1 * (_config.ez(p1) - _config.ez(ix));
+            _config.bz(ix) = _config.bz(ix) - cx1 * (_config.ey(p1) - _config.ey(ix));
         }else if(_config.field(0).field_order == 4){
             c1 = 9.0/8.0;
             c2 = -1.0 / 24.0;
@@ -447,10 +471,6 @@ void interpolate_from_grid_tophat(double part_weight, double part_q, double part
 
     *bx_part = gx[0] * bx((*cell_x1) + ng) + gx[1] * bx((*cell_x1) + 1 + ng);
     *by_part = hx[0] * by(cell_x2 + ng) + hx[1] * by(cell_x2 + 1 + ng);
-/*    if (std::isinf(*by_part)){
-        std::cout << "by_part is inf" << hx[0] << ", " << cell_x2+ng << ", " << by(cell_x2 + 1 + ng) << "\n";
-        abort();
-    }*/
     *bz_part = hx[0] * bz(cell_x2 + ng) + hx[1] * bz(cell_x2 + 1 + ng);
 //    std::cout << "vals: " << *bz_part << ", " << dcellx << ", " << cell_x2 + ng << ", " << bz(cell_x2 + ng) << "\n";
 //    std::cout << "cont: " << hx[0] << ", " << hx[1] << ", " << cell_x2 + 1 + ng << ", " << bz(cell_x2 + 1 + ng) << ", " << bz.size() << "\n";
@@ -461,7 +481,7 @@ KOKKOS_INLINE_FUNCTION
 void GatherForcesToGrid(double part_weight, double part_q,
                         double part_x, double delta_x,
                         int cell_x1, double *gx, double *hx,
-                        field_type jx, field_type jy, field_type jz,
+                        scatter_field_type scatter_jx, scatter_field_type scatter_jy, scatter_field_type scatter_jz,
                         double idt, double part_vy, double part_vz,
                         double idx, double dtco2, double idtf, double idxf,
                         int nx, int id, double fcx, double fcy, int jng){
@@ -506,9 +526,15 @@ void GatherForcesToGrid(double part_weight, double part_q,
         double jyh = fjy * wy;
         double jzh = fjz * wy;
         //Scatterview could be used here
-        Kokkos::atomic_add_fetch(&(jx(cx+jng)), jxh);
-        Kokkos::atomic_add_fetch(&(jy(cx+jng)), jyh);
-        Kokkos::atomic_add_fetch(&(jz(cx+jng)), jzh);
+        auto jx = scatter_jx.access();
+        auto jy = scatter_jy.access();
+        auto jz = scatter_jz.access();
+        jx(cx+jng) += jxh;
+        jy(cx+jng) += jyh;
+        jz(cx+jng) += jzh;
+//        Kokkos::atomic_add_fetch(&(jx(cx+jng)), jxh);
+//        Kokkos::atomic_add_fetch(&(jy(cx+jng)), jyh);
+//        Kokkos::atomic_add_fetch(&(jz(cx+jng)), jzh);
     }
 }
 
@@ -667,7 +693,7 @@ struct push_particles_functor{
 
         //TODO GatherForcesToGrid
         GatherForcesToGrid(part_weight, part_q, part_x, delta_x,
-                        cell_x1, gx, hx, _config.jx, _config.jy, _config.jz,
+                        cell_x1, gx, hx, _config.scatter_jx, _config.scatter_jy, _config.scatter_jz,
                         idt, part_vy, part_vz, idx, dtco2,
                         idtf, idxf, _nx, id, fcx, fcy, _jng);
     }
@@ -747,6 +773,8 @@ struct particle_bcs_functor{
         _box(box), _part_pos(part_poss), _rank(rank){
        _nranks = 1; 
         MPI_Comm_size( MPI_COMM_WORLD, &_nranks );
+        _box.x_max = box.x_max;
+        _box.x_min = box.x_min;
     }
 
     //SIMD Parallelised implementation for now
@@ -768,6 +796,60 @@ struct particle_bcs_functor{
         _rank.access(ix, ij) = rank;
     }
 
+};
+
+template<class PartPosSlice, class RankSlice, class LastPosSlice>
+struct kokkos_particle_bcs_functor{
+    boundary _box;
+    PartPosSlice _part_pos;
+    LastPosSlice _last_pos;
+    RankSlice _rank;
+    int _myrank;
+    int _nranks;
+    double _x_min_local;
+    double _x_max_local;
+
+    KOKKOS_INLINE_FUNCTION
+    kokkos_particle_bcs_functor(boundary box, PartPosSlice part_poss, RankSlice rank, LastPosSlice last_pos_s,
+            double x_min_local, double x_max_local):
+        _box(box), _part_pos(part_poss), _rank(rank), _last_pos(last_pos_s), _x_min_local(x_min_local),
+        _x_max_local(x_max_local){
+        _nranks = 1; 
+        MPI_Comm_rank( MPI_COMM_WORLD, &_myrank);
+        MPI_Comm_size( MPI_COMM_WORLD, &_nranks );
+        _box.x_max = box.x_max;
+        _box.x_min = box.x_min;
+    }
+
+    void operator()(const int i, double &lmax) const{
+        if( _part_pos(i, 0) < _x_min_local){
+            int rank = _myrank - 1;
+            if(rank < 0) rank = _nranks-1;
+            _rank(i) = rank;
+        }
+        if( _part_pos(i, 0) >= _x_max_local){
+            int rank = _myrank + 1;
+            if(rank >= _nranks) rank = 0;
+            _rank(i) = rank;
+        }
+        double movement = fabs(_part_pos(i, 0) - _last_pos(i,0));
+        lmax = movement;
+        if(_part_pos(i, 0) >= _box.x_max){
+            _part_pos(i, 0) -= (_box.x_max - _box.x_min);
+        }
+        if(_part_pos(i, 0) < _box.x_min){
+            _part_pos(i, 0) += (_box.x_max - _box.x_min);
+        }
+        _last_pos(i, 0) = _part_pos(i, 0);
+
+        //Compute rank for this particle to go to.
+//        double size = _box.x_max - _box.x_min;
+        // Compute relative position to the minimum
+//        double position = _part_pos(i,0) - _box.x_min;
+//        double size_per_rank = size / ((double) _nranks);
+//        int rank = (int)(position/size_per_rank);
+//       _rank(i) = rank;
+    }
 };
 
 
@@ -801,7 +883,7 @@ void set_field_order(int order, field_struct_host &field /* struct field *field*
 }
 
 void minimal_init(field_struct_host &field /*struct field *field*/, double x_grid_min_local,
-                   double x_grid_max_local){
+                   double x_grid_max_local, double x_max_local, double x_min_local){
 
     //Real is double precision
     //
@@ -841,6 +923,8 @@ void minimal_init(field_struct_host &field /*struct field *field*/, double x_gri
     set_field_order(2, field);
     field(0).x_grid_min_local = x_grid_min_local;
     field(0).x_grid_max_local = x_grid_max_local;
+    field(0).x_min_local = x_min_local;
+    field(0).x_max_local = x_max_local;
   //  field(0).x_grid_min_local = 3.5087719298245611E-005;
 //    field(0).x_grid_max_local = 1.9999649122807017;
 /*    field->x_grid_min_local = 3.5087719298245611E-005;
@@ -920,6 +1004,284 @@ void after_control(field_type::HostMirror &ex,
     set_initial_values(ex, ey, ez, bx, by, bz, jx, jy, jz, nx, ng, jng);
 }
 
+void hdf5_input(Cabana::AoSoA<DataTypes, HostType, VectorLength> &particle_aosoa,
+        Cabana::AoSoA<DataTypes, DeviceType, VectorLength> &non_host_aosoa,
+        struct config_type &config, boundary &box, int ng, int jng, int myrank, int nranks,
+        int *mincell, int *maxcell, int *nxglobal, int *npart_global, int *npart, int *nxlocal, double *t_end){
+    // Open HDF5 file
+    hid_t file_id = H5Fopen("input.hdf5", H5F_ACC_RDONLY, H5P_DEFAULT);
+    if( file_id < 0 ){
+        printf("Failed to open input.hdf5\n");
+        exit(1);
+    }
+    hid_t temp_space;
+    hsize_t dims[1];
+
+    // Load the grid
+    hid_t boxinfo = H5Dopen2(file_id, "Box_Size", H5P_DEFAULT);
+    double* box_temp = (double*) malloc(sizeof(double) * 2);
+    H5Dread(boxinfo, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, box_temp);
+    box.x_min = box_temp[0];
+    box.x_max = box_temp[1];
+    free(box_temp);
+    H5Dclose(boxinfo);
+
+    hid_t end = H5Dopen2(file_id, "t_end", H5P_DEFAULT);
+    H5Dread(end, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, t_end);
+    H5Dclose(end);
+
+    hid_t f_ex = H5Dopen2(file_id, "Electric_Field_Ex", H5P_DEFAULT);
+    temp_space = H5Dget_space(f_ex);
+    H5Sget_simple_extent_dims(temp_space, dims, NULL);
+    int size_grid = dims[0];
+
+    //Get global and local grid info
+    *nxglobal = size_grid;
+    *nxlocal = 0;
+    if(*nxglobal % nranks == 0){
+        *nxlocal = *nxglobal / nranks;
+    }else{
+        *nxlocal = *nxglobal / nranks;
+        if(*nxglobal % nranks > myrank){
+            (*nxlocal)++;
+        }
+    }
+    printf("[%i] nxlocal=%i, nxglobal=%i\n", myrank, *nxlocal, *nxglobal);
+    int min_local_cell = (myrank * (*nxglobal / nranks));
+    if(*nxglobal % nranks != 0){
+        if( myrank > *nxglobal % nranks ){
+            min_local_cell += (*nxglobal % nranks);
+        }else{
+            min_local_cell += (myrank);
+        }
+    }
+    //Exclusive
+    int max_local_cell = min_local_cell + *nxlocal;
+    *mincell = min_local_cell;
+    *maxcell = max_local_cell;
+
+    //Now we got the local grid info, load the local grid.
+    size_grid = *nxlocal;
+    config.ex = field_type("ex", size_grid + 2*ng);
+    config.ey = field_type("ey", size_grid + 2*ng);
+    config.ez = field_type("ez", size_grid + 2*ng);
+    config.bx = field_type("bx", size_grid + 2*ng);
+    config.by = field_type("by", size_grid + 2*ng);
+    config.bz = field_type("bz", size_grid + 2*ng);
+    config.jx = field_type("jx", size_grid + 2*jng);
+    config.jy = field_type("jy", size_grid + 2*jng);
+    config.jz = field_type("jz", size_grid + 2*jng);
+
+    config.scatter_jx = scatter_field_type(config.jx);
+    config.scatter_jy = scatter_field_type(config.jy);
+    config.scatter_jz = scatter_field_type(config.jz);
+
+    auto host_ex = Kokkos::create_mirror_view(config.ex);
+    auto host_ey = Kokkos::create_mirror_view(config.ey);
+    auto host_ez = Kokkos::create_mirror_view(config.ez);
+    auto host_bx = Kokkos::create_mirror_view(config.bx);
+    auto host_by = Kokkos::create_mirror_view(config.by);
+    auto host_bz = Kokkos::create_mirror_view(config.bz);
+    auto host_jx = Kokkos::create_mirror_view(config.jx);
+    auto host_jy = Kokkos::create_mirror_view(config.jy);
+    auto host_jz = Kokkos::create_mirror_view(config.jz);
+
+    //TODO We can do this smarter one day using offsets
+    double* ex_temp_array = (double*) malloc(sizeof(double) * *nxglobal);
+    //already done hid_t f_ex = H5Dopen2(file_id, "Electric_Field_Ex", H5P_DEFAULT);
+    H5Dread(f_ex, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, ex_temp_array);
+    for(int i = 0; i < size_grid; i++){
+        host_ex(i+ng) = ex_temp_array[min_local_cell + i];
+    }
+    free(ex_temp_array);
+    H5Dclose(f_ex);
+
+    double* ey_temp_array = (double*) malloc(sizeof(double) * *nxglobal);
+    hid_t f_ey = H5Dopen2(file_id, "Electric_Field_Ey", H5P_DEFAULT);
+    H5Dread(f_ey, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, ey_temp_array);
+    for(int i = 0; i < size_grid; i++){
+        host_ey(i+ng) = ey_temp_array[min_local_cell + i];
+    }
+    free(ey_temp_array);
+    H5Dclose(f_ey);
+
+    double* ez_temp_array = (double*) malloc(sizeof(double) * *nxglobal);
+    hid_t f_ez = H5Dopen2(file_id, "Electric_Field_Ez", H5P_DEFAULT);
+    H5Dread(f_ez, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, ez_temp_array);
+    for(int i = 0; i < size_grid; i++){
+        host_ez(i+ng) = ez_temp_array[min_local_cell + i];
+    }
+    free(ez_temp_array);
+    H5Dclose(f_ez);
+
+
+    double* bx_temp_array = (double*) malloc(sizeof(double) * *nxglobal);
+    hid_t f_bx = H5Dopen2(file_id, "Magnetic_Field_Bx", H5P_DEFAULT);
+    H5Dread(f_bx, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bx_temp_array);
+    for(int i = 0; i < size_grid; i++){
+        host_bx(i+ng) = bx_temp_array[min_local_cell + i];
+    }
+    free(bx_temp_array);
+    H5Dclose(f_bx);
+
+    double* by_temp_array = (double*) malloc(sizeof(double) * *nxglobal);
+    hid_t f_by = H5Dopen2(file_id, "Magnetic_Field_By", H5P_DEFAULT);
+    H5Dread(f_by, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, by_temp_array);
+    for(int i = 0; i < size_grid; i++){
+        host_by(i+ng) = by_temp_array[min_local_cell + i];
+    }
+    free(by_temp_array);
+    H5Dclose(f_by);
+
+    double* bz_temp_array = (double*) malloc(sizeof(double) * *nxglobal);
+    hid_t f_bz = H5Dopen2(file_id, "Magnetic_Field_Bz", H5P_DEFAULT);
+    H5Dread(f_bz, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bz_temp_array);
+    printf("Read %i elements into host_bz, size of kokkos ds is %i\n", size_grid, host_bz.size());
+    for(int i = 0; i < size_grid; i++){
+        host_bz(i+ng) = bz_temp_array[min_local_cell + i];
+    }
+    free(bz_temp_array);
+    H5Dclose(f_bz);
+
+    for(int i = 0; i < ng; i++){
+        host_ex(i) = 0.0;
+        host_ey(i) = 0.0;
+        host_ez(i) = 0.0;
+        host_bx(i) = 0.0;
+        host_by(i) = 0.0;
+        host_bz(i) = 0.0;
+        host_ex(ng+size_grid+i) = 0.0;
+        host_ey(ng+size_grid+i) = 0.0;
+        host_ez(ng+size_grid+i) = 0.0;
+        host_bx(ng+size_grid+i) = 0.0;
+        host_by(ng+size_grid+i) = 0.0;
+        host_bz(ng+size_grid+i) = 0.0;
+    }
+    for(int i = 0; i < size_grid+2*jng; i++){
+        host_jx(i) = 0.0;
+        host_jy(i) = 0.0;
+        host_jz(i) = 0.0;
+    }
+    // Copy data to the real data
+    Kokkos::deep_copy(config.ex, host_ex);
+    Kokkos::deep_copy(config.ey, host_ey);
+    Kokkos::deep_copy(config.ez, host_ez);
+    Kokkos::deep_copy(config.bx, host_bx);
+    Kokkos::deep_copy(config.by, host_by);
+    Kokkos::deep_copy(config.bz, host_bz);
+    Kokkos::deep_copy(config.jx, host_jx);
+    Kokkos::deep_copy(config.jy, host_jy);
+    Kokkos::deep_copy(config.jz, host_jz);
+
+    //TODO Set local domain size etc.
+    auto host_field = Kokkos::create_mirror_view(config.field);
+
+    double dx = (box.x_max - box.x_min) / (double)(*nxglobal);
+    host_field(0).x_min_local = min_local_cell * dx;
+    host_field(0).x_max_local = max_local_cell * dx;
+    host_field(0).x_grid_min_local = host_field(0).x_min_local + dx/2.0;
+    host_field(0).x_grid_max_local = host_field(0).x_max_local - dx/2.0;
+    printf("[%i] domain [%i %i] [%f, %f]\n", myrank, min_local_cell, max_local_cell, host_field(0).x_min_local, host_field(0).x_max_local);
+
+    Kokkos::deep_copy(config.field, host_field);
+
+    //TODO Load the particles
+    if(H5Lexists(file_id, "positions", H5P_DEFAULT)){
+        hid_t f_positions = H5Dopen2(file_id, "positions", H5P_DEFAULT);
+        temp_space = H5Dget_space(f_positions);
+        H5Sget_simple_extent_dims(temp_space, dims, NULL);
+        double* pos_temp_array = (double*) malloc(sizeof(double) * dims[0]);
+        H5Dread(f_positions, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, pos_temp_array);
+        H5Dclose(f_positions);
+        
+        int global_parts = dims[0];
+        *npart_global = global_parts;
+        int num_parts = 0;
+        for(int i = 0; i < global_parts; i++){
+            if(pos_temp_array[i] >= host_field(0).x_min_local && pos_temp_array[i] < host_field(0).x_max_local){
+                num_parts++;
+            }
+        }
+        int new_size = static_cast<int>(num_parts);
+        std::cout << "new size is " << new_size << "\n";
+        particle_aosoa.resize(new_size);
+        non_host_aosoa.resize(new_size);
+
+        hid_t filespace;
+        hsize_t shape[2], offsets[2];
+        int r = 2;
+        shape[0] = global_parts;
+        shape[1] = 1;
+        offsets[0] = 0;
+        offsets[1] = 0;
+        hid_t memspace = H5Screate_simple(r, shape, NULL);
+        //Load all the data for now.
+        hid_t f_charge = H5Dopen2(file_id, "charge", H5P_DEFAULT);
+        double* charge_temp_array = (double*) malloc(sizeof(double) * global_parts);
+        H5Dread(f_charge, H5T_NATIVE_DOUBLE, memspace, H5S_ALL, H5P_DEFAULT, charge_temp_array);
+        H5Dclose(f_charge);
+
+        hid_t f_mass = H5Dopen2(file_id, "mass", H5P_DEFAULT);
+        double* mass_temp_array = (double*) malloc(sizeof(double) * global_parts);
+        H5Dread(f_mass, H5T_NATIVE_DOUBLE, memspace, H5S_ALL, H5P_DEFAULT, mass_temp_array);
+        H5Dclose(f_mass);
+
+        double* weight_temp_array = (double*) malloc(sizeof(double) * global_parts);
+        hid_t f_weight = H5Dopen2(file_id, "weight", H5P_DEFAULT);
+        H5Dread(f_weight, H5T_NATIVE_DOUBLE, memspace, H5S_ALL, H5P_DEFAULT, weight_temp_array);
+        H5Dclose(f_weight);
+
+        hid_t momentum_x = H5Dopen2(file_id, "momentum_x", H5P_DEFAULT);
+        double* momentum_x_array = (double*) malloc(sizeof(double) * global_parts);
+        H5Dread(momentum_x, H5T_NATIVE_DOUBLE, memspace, H5S_ALL, H5P_DEFAULT, momentum_x_array);
+        H5Dclose(momentum_x);
+        hid_t momentum_y = H5Dopen2(file_id, "momentum_y", H5P_DEFAULT);
+        double* momentum_y_array = (double*) malloc(sizeof(double) * global_parts);
+        H5Dread(momentum_y, H5T_NATIVE_DOUBLE, memspace, H5S_ALL, H5P_DEFAULT, momentum_y_array);
+        H5Dclose(momentum_y);
+        hid_t momentum_z = H5Dopen2(file_id, "momentum_z", H5P_DEFAULT);
+        double* momentum_z_array = (double*) malloc(sizeof(double) * global_parts);
+        H5Dread(momentum_z, H5T_NATIVE_DOUBLE, memspace, H5S_ALL, H5P_DEFAULT, momentum_z_array);
+        H5Dclose(momentum_z);
+
+        //Read all the data, get the slices.
+        auto weight_slice = Cabana::slice<weight>(particle_aosoa);
+        auto charge_slice = Cabana::slice<charge>(particle_aosoa);
+        auto mass_slice = Cabana::slice<mass>(particle_aosoa);
+        auto pos_slice = Cabana::slice<part_pos>(particle_aosoa);
+        auto p_slice = Cabana::slice<part_p>(particle_aosoa);
+        auto rank_slice = Cabana::slice<rank>(particle_aosoa);
+        auto last_pos_slice = Cabana::slice<last_pos>(particle_aosoa);
+        int l_id = 0;
+        for(int i = 0; i < global_parts; i++){
+            if(pos_temp_array[i] >= host_field(0).x_min_local && pos_temp_array[i] < host_field(0).x_max_local){
+                pos_slice(l_id, 0) = pos_temp_array[i];
+                last_pos_slice(l_id, 0) = pos_temp_array[i];
+                p_slice(l_id, 0) = momentum_x_array[i];
+                p_slice(l_id, 1) = momentum_y_array[i];
+                p_slice(l_id, 2) = momentum_z_array[i];
+                weight_slice(l_id) = weight_temp_array[i];
+                mass_slice(l_id) = mass_temp_array[i];
+                charge_slice(l_id) = charge_temp_array[i];
+                rank_slice(l_id) = myrank;
+                l_id++;
+            }
+        }
+
+        //Free all the temp data stores
+        free(pos_temp_array);
+        free(charge_temp_array);
+        free(mass_temp_array);
+        free(weight_temp_array);
+        free(momentum_x_array);
+        free(momentum_y_array);
+        free(momentum_z_array);
+    }else{
+        particle_aosoa.resize(0);
+        non_host_aosoa.resize(0);
+    }
+}
+
 void auto_load(Cabana::AoSoA<DataTypes, HostType, VectorLength> &particle_aosoa,
                boundary box, int npart, int ncell, double cell_size, int nxglobal,
                double dx, int myrank, int nranks, int mincell, int maxcell){
@@ -962,12 +1324,12 @@ void auto_load(Cabana::AoSoA<DataTypes, HostType, VectorLength> &particle_aosoa,
     }
     double counter = 0;
 
-    auto id_slice = Cabana::slice<id>(particle_aosoa);
-    auto mass_slice = Cabana::slice<mass>(particle_aosoa);
-    auto charge_slice = Cabana::slice<charge>(particle_aosoa);
-    auto weight_slice = Cabana::slice<weight>(particle_aosoa);
-    auto part_pos_slice = Cabana::slice<part_pos>(particle_aosoa);
-    auto part_p_slice = Cabana::slice<part_p>(particle_aosoa);
+    auto id_slice = Cabana::slice<id>(particle_aosoa, "id");
+    auto mass_slice = Cabana::slice<mass>(particle_aosoa, "mass");
+    auto charge_slice = Cabana::slice<charge>(particle_aosoa, "charge");
+    auto weight_slice = Cabana::slice<weight>(particle_aosoa, "weight");
+    auto part_pos_slice = Cabana::slice<part_pos>(particle_aosoa, "part_pos_slice");
+    auto part_p_slice = Cabana::slice<part_p>(particle_aosoa, "part_p");
     for(int i = 0; i < 2; i++){
         double npart_per_cell_average = (double)(species_count[i]) / (double)(maxcell-mincell);
         if(npart_per_cell_average <= 0) continue;
@@ -1032,7 +1394,7 @@ void auto_load(Cabana::AoSoA<DataTypes, HostType, VectorLength> &particle_aosoa,
         }
         free(npart_in_cell);
         std::cout << counter << " particles loaded\n";
-        auto rank_slice = Cabana::slice<rank>(particle_aosoa);
+        auto rank_slice = Cabana::slice<rank>(particle_aosoa, "rank");
         particle_bcs_functor<decltype(part_pos_slice), decltype(rank_slice)> pbf(box, part_pos_slice, rank_slice);
         //Cabana::SimdPolicy<VectorLength, ExecutionSpace> simd_policy( 0,
 //                                              particle_aosoa.size());
@@ -1120,6 +1482,208 @@ void current_start(field_type jx, field_type jy, field_type jz, int nxlocal, int
 //        Kokkos::fence();
 //}
 
+void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> particle_aosoa,
+                     host_mirror_type ex, host_mirror_type ey, host_mirror_type ez,
+                     host_mirror_type bx, host_mirror_type by, host_mirror_type bz, 
+		     host_mirror_type jx, host_mirror_type jy, host_mirror_type jz,
+                     int output, int grid_size, int nxglobal, int ng, int jng, struct config_type &config,
+                     int myrank, int nranks){
+    // Create HDF5 file
+    char filename[250];
+    sprintf(filename, "%.4d.hdf5", output);
+
+    // Setup parallel access
+    hid_t acc_template = H5Pcreate(H5P_FILE_ACCESS);
+    MPI_Info info; MPI_Info_create(&info);
+    H5Pset_fapl_mpio(acc_template, MPI_COMM_WORLD, info);
+    hid_t file_id = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, acc_template);
+
+    if(file_id < 0){
+        std::cout << "[" << myrank << "] failed to open " << filename << "\n";
+        abort();
+    }
+    hsize_t h_dims[1];
+    h_dims[0] = particle_aosoa.size();
+
+    int my_offset = 0;
+    if(myrank == 0 && nranks > 1){
+        int npart = particle_aosoa.size();
+        MPI_Send(&npart, 1, MPI_INT, 1, 0, MPI_COMM_WORLD);
+    }else if (myrank == nranks-1){
+        MPI_Recv(&my_offset, 1, MPI_INT, myrank-1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }else{
+        MPI_Recv(&my_offset, 1, MPI_INT, myrank-1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        int npart = my_offset + particle_aosoa.size();
+        MPI_Send(&npart, 1, MPI_INT, myrank+1, 0, MPI_COMM_WORLD);
+    }
+
+    int global_part_count = 0;
+    MPI_Allreduce( &h_dims[0], &global_part_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    hsize_t gpc = (hsize_t) global_part_count;
+    hid_t global_dim = H5Screate_simple(1, &gpc, NULL);
+
+    hsize_t offset[2];
+    hsize_t count[2];
+    offset[0] = my_offset;
+    offset[1] = 0;
+    count[0] = h_dims[0];
+    count[1] = 0;
+    H5Sselect_hyperslab(global_dim, H5S_SELECT_SET, offset, NULL, count, NULL);
+
+    hid_t memspace = H5Screate_simple(1, h_dims, NULL);
+
+    //Offset in memspace is 0
+    offset[0] = 0;
+    H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offset, NULL, count, NULL);
+
+    double *temp = (double*)malloc(sizeof(double) * particle_aosoa.size());
+    hid_t positions = H5Dcreate2(file_id, "position", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    //Store the positions
+    for(int i = 0; i < particle_aosoa.size(); i++){
+        auto part = particle_aosoa.getTuple(i);
+        double pos = Cabana::get<part_pos>(part,0);
+        temp[i] = pos;
+    }
+    H5Dwrite(positions, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(positions);
+
+    hid_t Px = H5Dcreate2(file_id, "Particles_Px", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < particle_aosoa.size(); i++){
+        auto part = particle_aosoa.getTuple(i);
+        double pos = Cabana::get<part_p>(part,0);
+        temp[i] = pos;
+    }
+    H5Dwrite(Px, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Px);
+        
+    hid_t Py = H5Dcreate2(file_id, "Particles_Py", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < particle_aosoa.size(); i++){
+        auto part = particle_aosoa.getTuple(i);
+        double pos = Cabana::get<part_p>(part,1);
+        temp[i] = pos;
+    }
+    H5Dwrite(Py, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Py);
+
+    hid_t Pz = H5Dcreate2(file_id, "Particles_Pz", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < particle_aosoa.size(); i++){
+        auto part = particle_aosoa.getTuple(i);
+        double pos = Cabana::get<part_p>(part,2);
+        temp[i] = pos;
+    }
+    H5Dwrite(Pz, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Pz);
+
+    hid_t pmass = H5Dcreate2(file_id, "Particles_mass", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < particle_aosoa.size(); i++){
+        auto part = particle_aosoa.getTuple(i);
+        temp[i] = Cabana::get<mass>(part);
+    }
+    H5Dwrite(pmass, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(pmass);
+
+    free(temp);
+
+    temp = (double*)malloc(sizeof(double) * grid_size);
+    h_dims[0] = grid_size;
+    hsize_t nxg = nxglobal;
+    global_dim = H5Screate_simple(1, &nxg, NULL);
+
+    my_offset = 0;
+    if(myrank == 0 && nranks > 1){
+        int nxlocal = grid_size;
+        MPI_Send(&nxlocal, 1, MPI_INT, 1, 0, MPI_COMM_WORLD);
+    }else if (myrank == nranks-1){
+        MPI_Recv(&my_offset, 1, MPI_INT, myrank-1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }else{
+        MPI_Recv(&my_offset, 1, MPI_INT, myrank-1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        int nxlocal = my_offset + grid_size;
+        MPI_Send(&nxlocal, 1, MPI_INT, myrank+1, 0, MPI_COMM_WORLD);
+    }
+
+    offset[0] = my_offset;
+    offset[1] = 0;
+    count[0] = h_dims[0];
+    count[1] = 0;
+    H5Sselect_hyperslab(global_dim, H5S_SELECT_SET, offset, NULL, count, NULL);
+
+    h_dims[0] = grid_size;
+    
+    memspace = H5Screate_simple(1, h_dims, NULL);
+
+    //Offset in memspace is 0
+    offset[0] = 0;
+    H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offset, NULL, count, NULL);
+
+    //Write the grid
+    hid_t Electric_Field_Ex = H5Dcreate2(file_id, "Electric_Field_Ex", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = ex(i+ng);
+    }
+    H5Dwrite(Electric_Field_Ex, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Electric_Field_Ex);
+
+    hid_t Electric_Field_Ey = H5Dcreate2(file_id, "Electric_Field_Ey", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = ey(i+ng);
+    }
+    H5Dwrite(Electric_Field_Ey, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Electric_Field_Ey);
+
+    hid_t Electric_Field_Ez = H5Dcreate2(file_id, "Electric_Field_Ez", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = ez(i+ng);
+    }
+    H5Dwrite(Electric_Field_Ez, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Electric_Field_Ez);
+
+    hid_t Magnetic_Field_Bx = H5Dcreate2(file_id, "Magnetic_Field_Bx", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = bx(i+ng);
+    }
+    H5Dwrite(Magnetic_Field_Bx, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Magnetic_Field_Bx);
+
+    hid_t Magnetic_Field_By = H5Dcreate2(file_id, "Magnetic_Field_By", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = by(i+ng);
+    }
+    H5Dwrite(Magnetic_Field_By, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Magnetic_Field_By);
+
+    hid_t Magnetic_Field_Bz = H5Dcreate2(file_id, "Magnetic_Field_Bz", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = bz(i+ng);
+    }
+    H5Dwrite(Magnetic_Field_Bz, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Magnetic_Field_Bz);
+
+    hid_t Current_Jx = H5Dcreate2(file_id, "Current_Jx", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = jx(i+ng);
+    }
+    H5Dwrite(Current_Jx, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Current_Jx);
+
+    hid_t Current_Jy = H5Dcreate2(file_id, "Current_Jy", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = jy(i+ng);
+    }
+    H5Dwrite(Current_Jy, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Current_Jy);
+
+    hid_t Current_Jz = H5Dcreate2(file_id, "Current_Jz", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    for(int i = 0; i < grid_size; i++){
+        temp[i] = jz(i+ng);
+    }
+    H5Dwrite(Current_Jz, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dclose(Current_Jz);
+
+    free(temp);
+    H5Fclose(file_id);
+}
+                            
+
 void output_routines(Cabana::AoSoA<DataTypes, HostType, VectorLength> particle_aosoa,
                      host_mirror_type ex, host_mirror_type ey, host_mirror_type ez,
                      host_mirror_type bx, host_mirror_type by, host_mirror_type bz, 
@@ -1128,8 +1692,7 @@ void output_routines(Cabana::AoSoA<DataTypes, HostType, VectorLength> particle_a
 
     // Create HDF5 file
     char filename[250];
-    int myrank; MPI_Comm_rank( MPI_COMM_WORLD, &myrank );
-    sprintf(filename, "%.4d_%.4d.hdf5", output, myrank);
+    sprintf(filename, "%.4d.hdf5", output);
     hid_t file_id = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     hsize_t h_dims[1];
     h_dims[0] = particle_aosoa.size();
@@ -1381,9 +1944,11 @@ template<class aosoa> class Migrator{
         Kokkos::View<double**, MemorySpace> px_space;
         Kokkos::View<double**, MemorySpace> py_space;
         Kokkos::View<double**, MemorySpace> pz_space;
+        int _buffer_size;
 
     public:
         Migrator(int buffer_size, int nr_neighbours){
+            _buffer_size = buffer_size;
             id_space = Kokkos::View<int**, MemorySpace>("temp_id", nr_neighbours, buffer_size);
             weight_space = Kokkos::View<double**, MemorySpace>("temp_weight", nr_neighbours, buffer_size);
             mass_space = Kokkos::View<double**, MemorySpace>("temp_mass", nr_neighbours, buffer_size);
@@ -1396,7 +1961,7 @@ template<class aosoa> class Migrator{
 
         void exchange_data( aosoa &particle_aosoa, std::vector<int> neighbors, int myrank, int npart){
 
-            auto rank_slice = Cabana::slice<rank>(particle_aosoa);
+            auto rank_slice = Cabana::slice<rank>(particle_aosoa, "rank");
  //          Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
            //Initial migration
 //           Cabana::migrate( distributor, particle_aosoa );
@@ -1409,12 +1974,13 @@ template<class aosoa> class Migrator{
 //             Kokkos::View<double*, MemorySpace> px_space("temp_px", npart/10);
 //             Kokkos::View<double*, MemorySpace> py_space("temp_py", npart/10);
 //             Kokkos::View<double*, MemorySpace> pz_space("temp_pz", npart/10);
-             auto id_s = Cabana::slice<id>(particle_aosoa);
-             auto weight_s = Cabana::slice<weight>(particle_aosoa);
-             auto mass_s = Cabana::slice<mass>(particle_aosoa);
-             auto charge_s = Cabana::slice<charge>(particle_aosoa);
-             auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa);
-             auto part_p_s = Cabana::slice<part_p>(particle_aosoa);
+             auto id_s = Cabana::slice<id>(particle_aosoa, "id");
+             auto weight_s = Cabana::slice<weight>(particle_aosoa, "weight");
+             auto mass_s = Cabana::slice<mass>(particle_aosoa, "mass");
+             auto charge_s = Cabana::slice<charge>(particle_aosoa, "charge");
+             auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "part_pos");
+             auto part_p_s = Cabana::slice<part_p>(particle_aosoa, "part_p");
+             auto last_pos_s = Cabana::slice<last_pos>(particle_aosoa, "last_pos");
              int *send_count = (int*) malloc(sizeof(int) * neighbors.size());
 //             int *send_pos = (int*) malloc(sizeof(int) * neighbors.size());
              int count_neighbours = 0;
@@ -1470,6 +2036,9 @@ template<class aosoa> class Migrator{
                         }
                     }
                     int pos = send_count[therank];
+#ifndef NDEBUG
+                    assert(pos < _buffer_size);
+#endif
                     id_space(therank, pos) = id_s(i);
                     weight_space(therank, pos) = weight_s(i);
                     mass_space(therank, pos) = mass_s(i);
@@ -1481,7 +2050,7 @@ template<class aosoa> class Migrator{
                     send_count[therank]++;
 
                     //Move from end
-                    while(rank_slice(end) != myrank){
+                    while(rank_slice(end) != myrank && end > 0){
                         end--;
                     }
                     if(end > i){
@@ -1495,6 +2064,7 @@ template<class aosoa> class Migrator{
                         part_p_s(i, 0) = part_p_s(end, 0);
                         part_p_s(i, 1) = part_p_s(end, 1);
                         part_p_s(i, 2) = part_p_s(end, 2);
+                        last_pos_s(i, 0) = last_pos_s(end, 0);
                         rank_slice(end) = -1;
                     }else{
                         rank_slice(i) = -1;
@@ -1648,7 +2218,7 @@ template<class aosoa> class Migrator{
            if(size_change != 0){
             particle_aosoa.resize(current_size+size_change);
            }
-           auto new_rank_slice = Cabana::slice<rank>(particle_aosoa);
+           auto new_rank_slice = Cabana::slice<rank>(particle_aosoa, "new_rank");
             if(size_change > 0){
                 if(sent == 0){
                     end = current_size;
@@ -1657,29 +2227,35 @@ template<class aosoa> class Migrator{
                     new_rank_slice(i) = -1;
                 }
             }
-           auto new_id_s = Cabana::slice<id>(particle_aosoa);
-           auto new_weight_s = Cabana::slice<weight>(particle_aosoa);
-           auto new_mass_s = Cabana::slice<mass>(particle_aosoa);
-           auto new_charge_s = Cabana::slice<charge>(particle_aosoa);
-           auto new_part_pos_s = Cabana::slice<part_pos>(particle_aosoa);
-           auto new_part_p_s = Cabana::slice<part_p>(particle_aosoa);
+           auto new_id_s = Cabana::slice<id>(particle_aosoa, "new_id");
+           auto new_weight_s = Cabana::slice<weight>(particle_aosoa, "new_weight");
+           auto new_mass_s = Cabana::slice<mass>(particle_aosoa, "new_mass");
+           auto new_charge_s = Cabana::slice<charge>(particle_aosoa, "new_charge");
+           auto new_part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "new_part");
+           auto new_part_p_s = Cabana::slice<part_p>(particle_aosoa, "new_part_p");
+           auto new_last_pos_s = Cabana::slice<last_pos>(particle_aosoa, "new_last");
            int x = 0;
            for(int j = 0; j < neighbors.size(); j++){
                 for(int i = 0; i < recv_count[j]; i++){
 //                     if(myrank == 1 && r_id_space(j,i) == 1424990){   
 //                        std::cout << "Receieved ID 1424990 at " << j << ", " << i << " with position " << r_pos_space(j,i) << "\n" << std::flush;
 //                     }
+#ifndef NDEBUG
                      assert(new_rank_slice(end+x) == -1);
+#endif
                      new_id_s(end+x) = r_id_space(j,i);
                      new_weight_s(end+x) = r_weight_space(j,i);
                      new_mass_s(end+x) = r_mass_space(j,i);
                      new_charge_s(end+x) = r_charge_space(j,i);
                      //assert(r_pos_space(j,i) == r_pos_space(j,i));
                      new_part_pos_s(end+x,0) = r_pos_space(j,i);
+                     new_part_pos_s(end+x,1) = 0.0;
+                     new_part_pos_s(end+x,2) = 0.0;
                      new_part_p_s(end+x,0) = r_px_space(j,i);
                      new_part_p_s(end+x,1) = r_py_space(j,i);
                      new_part_p_s(end+x,2) = r_pz_space(j,i);
                      new_rank_slice(end+x) = myrank;
+                     new_last_pos_s(end+x, 0) = new_part_pos_s(end+x,0);
                      x++;
                 }
            }
@@ -1690,6 +2266,7 @@ template<class aosoa> class Migrator{
 //        std::cout << "Last updated was " << end+x-1 << ". AoSoA size is " << particle_aosoa.size() << "\n";
            
         //TODO Check somehow all positions/values are "nice"
+#ifndef NDEBUG
         for(int i = 0; i < particle_aosoa.size(); i++){
 //            if(new_part_pos_s(i, 0) < 0.0){
 //                std::cout << "found particle at " << new_part_pos_s(i, 0) << " with id " << new_id_s(i) << "\n";
@@ -1697,8 +2274,18 @@ template<class aosoa> class Migrator{
             assert(new_part_pos_s(i,0) >= 0.0);
             assert(new_part_pos_s(i,0) <= 2.0);
             assert(new_part_pos_s(i,0) == new_part_pos_s(i,0));
+            assert(new_mass_s(i) > 0);
+            assert(new_charge_s(i) != 0);
+            assert(new_weight_s(i) > 0);
             assert(new_rank_slice(i) == myrank);
+            if(new_part_p_s(i, 1) >= 1.0 || new_part_p_s(i, 1) <=-1.0){
+                printf("[%i] y_momentum of %e at index %i\n", myrank, new_part_p_s(i,1), i);
+            }
+            assert(new_part_p_s(i, 1) < 1.0);
+            assert(new_part_p_s(i, 1) >-1.0);
+            assert(new_part_pos_s(i,0) == new_last_pos_s(i,0));
         }
+#endif
            
            
     }
@@ -1706,97 +2293,153 @@ template<class aosoa> class Migrator{
 
 int main(int argc, char* argv[] ){
     //TODO
-    
+   
+    feenableexcept(FE_DIVBYZERO | FE_INVALID | FE_OVERFLOW );
     Kokkos::ScopeGuard scope_guard(argc, argv);
     int provided;
     MPI_Init_thread( &argc, &argv, MPI_THREAD_FUNNELED, &provided  );
+    // Override the SIGTERM handler AFTER the call to MPI_Init
+//    signal(SIGTERM, term_handler);
+    double t_end = 6.2132e-9;
 //    Kokkos::initialize(argc,argv);
     {
-        int step = 0;
-        double time = 0.0;
+            int step = 0;
+            double time = 0.0;
     
-        struct config_type config;
-        // TODO MPI INIT ignore
-        config.field = field_struct_type("field", 1);
-        //struct field field;
-        //TODO Minimal init
-        auto host_field = Kokkos::create_mirror_view(config.field);
-        
-        int nxglobal = 28500;
-        int npart_global = nxglobal * 100;
-        int myrank; MPI_Comm_rank( MPI_COMM_WORLD, &myrank );
-        int nranks; MPI_Comm_size( MPI_COMM_WORLD, &nranks );
-        int npart = 0;
-        // This can be done better but it'll do for now.
-        if(npart_global % nranks == 0){
-            npart = npart_global / nranks;
-        }else{
-            npart = npart_global / nranks;
-            if(npart_global % nranks > myrank){
-                npart++;
-            }
-        }
-        //TODO: Compute local cell IDs
-        int nxlocal = 0;
-        if(nxglobal % nranks == 0){
-            nxlocal = nxglobal / nranks;
-        }else{
-            nxlocal = nxglobal / nranks;
-            if(nxglobal % nranks > myrank){
-                nxlocal++;
-            }
-        }
-        int min_local_cell = (myrank * (nxglobal / nranks));
-        if(nxglobal % nranks != 0){
-            if( myrank > nxglobal % nranks ){
-                min_local_cell += (nxglobal % nranks);
+            struct config_type config;
+            // TODO MPI INIT ignore
+            config.field = field_struct_type("field", 1);
+            //struct field field;
+            //TODO Minimal init
+            auto host_field = Kokkos::create_mirror_view(config.field);
+            
+            int nxglobal = 28500;
+            int npart_global = nxglobal * 100;
+            int myrank; MPI_Comm_rank( MPI_COMM_WORLD, &myrank );
+            int nranks; MPI_Comm_size( MPI_COMM_WORLD, &nranks );
+            int npart = 0;
+            // This can be done better but it'll do for now.
+            if(npart_global % nranks == 0){
+                npart = npart_global / nranks;
             }else{
-                min_local_cell += (myrank-1);
+                npart = npart_global / nranks;
+                if(npart_global % nranks > myrank){
+                    npart++;
+                }
             }
-        }
-        //Exclusive
-        int max_local_cell = min_local_cell + nxlocal;
-        double x_min = 0.0;
-        double x_max = 2.0;
-        double dx = 2.0 / (double)(nxglobal);
-        int ng = 4; // number ghost cells
-        int jng = 4; // number current ghost cells
-        //Setup boundary struct
-        boundary box;
-        box.x_min = 0.0;
-        box.x_max = 2.0;
-        double cell_size = (box.x_max - box.x_min) / (double)(nxglobal);
+            //TODO: Compute local cell IDs
+            int nxlocal = 0;
+            if(nxglobal % nranks == 0){
+                nxlocal = nxglobal / nranks;
+            }else{
+                nxlocal = nxglobal / nranks;
+                if(nxglobal % nranks > myrank){
+                    nxlocal++;
+                }
+            }
+            int min_local_cell = (myrank * (nxglobal / nranks));
+            if(nxglobal % nranks != 0){
+                if( myrank > nxglobal % nranks ){
+                    min_local_cell += (nxglobal % nranks);
+                }else{
+                    min_local_cell += (myrank-1);
+                }
+            }
+            //Exclusive
+            int max_local_cell = min_local_cell + nxlocal;
+            double dx = 2.0 / (double)(nxglobal);
+            double x_min = 0.0;
+            double x_max = 2.0;
+            int ng = 4; // number ghost cells
+            int jng = 4; // number current ghost cells
+            //Setup boundary struct
+            boundary box;
+            box.x_min = 0.0;
+            box.x_max = 2.0;
+            double cell_size = (box.x_max - box.x_min) / (double)(nxglobal);
 
-        //Compute local grid
-        double x_grid_min_local = 3.5087719298245611E-005 + min_local_cell * cell_size;
-        double x_grid_max_local = max_local_cell * cell_size;
-        minimal_init(host_field, x_grid_min_local, x_grid_max_local);
-        
-        config.ex = field_type("ex", nxlocal + 2*ng);
-        config.ey = field_type("ey", nxlocal + 2*ng);
-        config.ez = field_type("ez", nxlocal + 2*ng);
-        config.bx = field_type("bx", nxlocal + 2*ng);
-        config.by = field_type("by", nxlocal + 2*ng);
-        config.bz = field_type("bz", nxlocal + 2*ng);
-        config.jx = field_type("jx", nxlocal + 2*jng);
-        config.jy = field_type("jy", nxlocal + 2*jng);
-        config.jz = field_type("jz", nxlocal + 2*jng);
+            //Compute local grid
+            double x_grid_min_local = 0.5 * cell_size + min_local_cell * cell_size;
+            double x_grid_max_local = max_local_cell * cell_size - 0.5 * cell_size;
+            double x_min_local = min_local_cell * dx;
+            double x_max_local = max_local_cell * dx;
+            minimal_init(host_field, x_grid_min_local, x_grid_max_local, x_min_local, x_max_local);
+
+            Cabana::AoSoA<DataTypes, DeviceType, VectorLength> particle_aosoa( "particle_list",
+                                                                               npart);
+            Cabana::AoSoA<DataTypes, HostType, VectorLength> host_particle_aosoa( "particles_host",
+                                                                                  npart);
+            if(0){        
+            config.ex = field_type("ex", nxlocal + 2*ng);
+            config.ey = field_type("ey", nxlocal + 2*ng);
+            config.ez = field_type("ez", nxlocal + 2*ng);
+            config.bx = field_type("bx", nxlocal + 2*ng);
+            config.by = field_type("by", nxlocal + 2*ng);
+            config.bz = field_type("bz", nxlocal + 2*ng);
+            config.jx = field_type("jx", nxlocal + 2*jng);
+            config.jy = field_type("jy", nxlocal + 2*jng);
+            config.jz = field_type("jz", nxlocal + 2*jng);
+
+       	    config.scatter_jx = scatter_field_type(config.jx);
+       	    config.scatter_jy = scatter_field_type(config.jy);
+       	    config.scatter_jz = scatter_field_type(config.jz);
        
-        std::cout << "[" << myrank << "]" << config.ex.size() << "\n"; 
+            std::cout << "[" << myrank << "]" << "Have: " << nxlocal << " local grid cells. nxglobal = " << nxglobal<< "\n" <<  std::flush; 
     
-        //config.ex = field_type("ex", nxglobal + 2*ng);
-        //config.ey = field_type("ey", nxglobal + 2*ng);
-        //config.ez = field_type("ez", nxglobal + 2*ng);
-        //config.bx = field_type("bx", nxglobal + 2*ng);
-        //config.by = field_type("by", nxglobal + 2*ng);
-        //config.bz = field_type("bz", nxglobal + 2*ng);
-        //config.jx = field_type("jx", nxglobal + 2*jng);
-        //config.jy = field_type("jy", nxglobal + 2*jng);
-        //config.jz = field_type("jz", nxglobal + 2*jng);
+            //config.ex = field_type("ex", nxglobal + 2*ng);
+            //config.ey = field_type("ey", nxglobal + 2*ng);
+            //config.ez = field_type("ez", nxglobal + 2*ng);
+            //config.bx = field_type("bx", nxglobal + 2*ng);
+            //config.by = field_type("by", nxglobal + 2*ng);
+            //config.bz = field_type("bz", nxglobal + 2*ng);
+            //config.jx = field_type("jx", nxglobal + 2*jng);
+            //config.jy = field_type("jy", nxglobal + 2*jng);
+            //config.jz = field_type("jz", nxglobal + 2*jng);
 
-        //Actual positions go from ng to ng + nxglobal -1 inclusive
+            //Actual positions go from ng to ng + nxglobal -1 inclusive
     
-        // Make host copies for initialisation
+            // Make host copies for initialisation
+            auto host_ex = Kokkos::create_mirror_view(config.ex);
+            auto host_ey = Kokkos::create_mirror_view(config.ey);
+            auto host_ez = Kokkos::create_mirror_view(config.ez);
+            auto host_bx = Kokkos::create_mirror_view(config.bx);
+            auto host_by = Kokkos::create_mirror_view(config.by);
+            auto host_bz = Kokkos::create_mirror_view(config.bz);
+            auto host_jx = Kokkos::create_mirror_view(config.jx);
+            auto host_jy = Kokkos::create_mirror_view(config.jy);
+            auto host_jz = Kokkos::create_mirror_view(config.jz);
+
+    
+            //Set up particles
+    
+    
+   
+            
+            after_control(host_ex, host_ey, host_ez, host_bx, host_by,
+                          host_bz, host_jx, host_jy, host_jz, nxlocal,
+                          ng, jng);
+            
+            //open_files setup.f90 -- NYI for opening files
+            //
+            //
+            //Rescan input deck for things that required allocating
+            //read_deck
+            //after_deck_last
+            //
+            //if restart - ignore
+            //
+            //pre_load_balance //These two are TODO - Nothing to do on one node.
+
+            std::cout << "cell_size = " << cell_size << "\n";
+            auto_load(host_particle_aosoa, box, npart, nxglobal, cell_size, nxglobal, dx, myrank, nranks,
+                   min_local_cell, max_local_cell );
+
+        }else{
+            //TODO call input hdf5
+            hdf5_input(host_particle_aosoa, particle_aosoa, config, box, ng, jng, myrank, nranks,
+                        &min_local_cell, &max_local_cell, &nxglobal, &npart_global, &npart, &nxlocal, &t_end);
+            dx = (box.x_max - box.x_min) / (double)(nxglobal);
+        }
         auto host_ex = Kokkos::create_mirror_view(config.ex);
         auto host_ey = Kokkos::create_mirror_view(config.ey);
         auto host_ez = Kokkos::create_mirror_view(config.ez);
@@ -1806,61 +2449,15 @@ int main(int argc, char* argv[] ){
         auto host_jx = Kokkos::create_mirror_view(config.jx);
         auto host_jy = Kokkos::create_mirror_view(config.jy);
         auto host_jz = Kokkos::create_mirror_view(config.jz);
-
-    
-/*        Kokkos::parallel_for("Init e&b arrays", nxglobal+2*ng, 
-                KOKKOS_LAMBDA( const int &ix ){
-                    host_ex[ix] = 0.0;
-                    host_ey[ix] = 0.0;
-                    host_ez[ix] = 0.0;
-                    host_bx[ix] = 0.0;
-                    host_by[ix] = 0.0;
-                    host_bz[ix] = 0.0;
-        });
-        Kokkos::parallel_for("Init j arrays", nxglobal + 2*jng,
-                KOKKOS_LAMBDA(const int &ix){
-                host_jx[ix] = 0.0;
-                host_jy[ix] = 0.0;
-                host_jz[ix] = 0.0;
-        });*/
-    
-    
-        //Set up particles
-    
-        Cabana::AoSoA<DataTypes, DeviceType, VectorLength> particle_aosoa( "particle_list",
-                                                                           npart);
-        Cabana::AoSoA<DataTypes, HostType, VectorLength> host_particle_aosoa( "particles_host",
-                                                                              npart);
-    
-   
-        
-        after_control(host_ex, host_ey, host_ez, host_bx, host_by,
-                      host_bz, host_jx, host_jy, host_jz, nxlocal,
-                      ng, jng);
-        
-        //after_control(host_ex, host_ey, host_ez, host_bx, host_by,
-        //              host_bz, host_jx, host_jy, host_jz, nxglobal,
-        //              ng, jng);
-        //open_files setup.f90 -- NYI for opening files
-        //
-        //
-        //Rescan input deck for things that required allocating
-        //read_deck
-        //after_deck_last
-        //
-        //if restart - ignore
-        //
-        //pre_load_balance //These two are TODO - Nothing to do on one node.
-
-        std::cout << "cell_size = " << cell_size << "\n";
-        auto_load(host_particle_aosoa, box, npart, nxglobal, cell_size, nxglobal, dx, myrank, nranks,
-               min_local_cell, max_local_cell );
-        time = 0.0;
-
-        double dt = host_field(0).cfl * dx / c;
-        std::cout << "dt was " << dt << "\n";
-   
         //TODO efield_bcs
+        time = 0.0;
+        double dt = host_field(0).cfl * dx / c;
+        double dt_multiplier = 0.95; // random term
+        dt = dt * dt_multiplier;
+        std::cout << "dt was " << dt << "\n";
+        std::cout << "box is [" << box.x_min << "," << box.x_max << "\n";
+        std::cout << "dx is " << dx << "\n";
+        std::cout << "Particle array is of size " << particle_aosoa.size() << "\n";
         //Deep copy to main fields
         Kokkos::deep_copy(config.ex, host_ex);
         Kokkos::deep_copy(config.ey, host_ey);
@@ -1873,15 +2470,14 @@ int main(int argc, char* argv[] ){
         Kokkos::deep_copy(config.jz, host_jz);
         Kokkos::deep_copy(config.field, host_field);
         Cabana::deep_copy(particle_aosoa, host_particle_aosoa);
-        efield_bcs(config.ex, config.ey, config.ez, nxglobal, ng);
+        efield_bcs(config.ex, config.ey, config.ez, nxlocal, ng);
         double dt_store = dt;
         dt = dt / 2.0;
         time = time + dt;
-        bfield_final_bcs(config.bx, config.by, config.bz, nxglobal, ng);
+        bfield_final_bcs(config.bx, config.by, config.bz, nxlocal, ng);
         dt = dt_store;
 
         double particle_push_start_time = 0.0;
-        double t_end = 6.2132e-9;
 //        double t_end = 6.2132e-9 / 20.0;
 //        double t_end = dt * 120.0;
         std::cout << "dt = " << dt << "\n";
@@ -1889,6 +2485,9 @@ int main(int argc, char* argv[] ){
         bool halt = false;
         //double per_dump = t_end / 20.0;
         double per_dump = t_end / 20.0;
+        //per_dump = t_end / 100.0;
+//        double per_dump = dt - 1e-3*dt;
+//        double per_dump = t_end;
         double next_dump = per_dump;
         int dump_count = 0;
         //Deep copy to host fields
@@ -1900,9 +2499,15 @@ int main(int argc, char* argv[] ){
         Kokkos::deep_copy(host_bz, config.bz);
         Kokkos::deep_copy(host_jx, config.jx);
         Kokkos::deep_copy(host_jy, config.jy);
+        if(nranks > 1){
+            parallel_output_routine(host_particle_aosoa, host_ex, host_ey, host_ez,
+                     host_bx, host_by, host_bz, host_jx, host_jy, host_jz,
+                     dump_count, nxlocal, nxglobal, ng, jng, config, myrank, nranks);
+        }else{
         output_routines(host_particle_aosoa, host_ex, host_ey, host_ez,
                         host_bx, host_by, host_bz, host_jx, host_jy, host_jz,
                         dump_count, nxlocal, ng, jng);
+        }
         //TODO output_routines(pic_system, ex, ey, ez, bx, by, bz, jx, jy, jz, dump_count, nxglobal);
         dump_count++;
 
@@ -1915,7 +2520,17 @@ int main(int argc, char* argv[] ){
        
         
         Kokkos::RangePolicy<> rangepolicy(ng, nxlocal+ng+1);
-         
+        
+        //Test sorting
+        {
+            auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "part_pos");
+            double grid_min[3] = {x_min_local - dx, 0.0, 0.0};
+            double grid_max[3] = {x_max_local + dx, 0.01, 0.01};
+            double grid_delta[3] = {dx*10.0, 0.01, 0.01};
+            Cabana::LinkedCellList<DeviceType> cell_list( part_pos_s, grid_delta, grid_min, grid_max);
+            Cabana::permute(cell_list, particle_aosoa);
+        }
+
 //        Kokkos::RangePolicy<> rangepolicy(ng, nxglobal+ng+1);
 
 //        auto id_s = Cabana::slice<id>(particle_aosoa);
@@ -1935,15 +2550,20 @@ int main(int argc, char* argv[] ){
        auto unique_end = std::unique( neighbors.begin(), neighbors.end() );
        neighbors.resize( std::distance( neighbors.begin(), unique_end ) );
 
-       Migrator<decltype(particle_aosoa)> migrator(particle_aosoa.size() / 10, neighbors.size());
+       Migrator<decltype(particle_aosoa)> migrator(particle_aosoa.size(), neighbors.size());
        {
+#ifndef CABANA_MPI
            if(nranks > 1){
            migrator.exchange_data( particle_aosoa, neighbors, myrank, particle_aosoa.size());
            }
-//            auto rank_slice = Cabana::slice<rank>(particle_aosoa);
-//           Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
+#else           
+            kokkos_particle_bcs_functor<decltype(part_pos_s), decltype(rank_slice), decltype(last_pos_slice)> pbf(box, part_pos_s, rank_slice, last_pos_slice, host_field(0).x_min_local, host_field(0).x_max_local);
+            Kokkos::parallel_reduce("part_boundary_condition", particle_aosoa.size(), pbf, Kokkos::Max<double>(max_move));
+           auto rank_slice = Cabana::slice<rank>(particle_aosoa);
+           Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
            //Initial migration
-//           Cabana::migrate( distributor, particle_aosoa );
+           Cabana::migrate( distributor, particle_aosoa );
+#endif
            
 /*             Kokkos::View<int* , MemorySpace> id_space("temp_id", npart/10);
              Kokkos::View<double*, MemorySpace> weight_space("temp_weight", npart/10);
@@ -2115,19 +2735,25 @@ int main(int argc, char* argv[] ){
        double field_solve_end;
        double particle_start;
        double particle_end;
+
+       //Store the movement since the last remesh operation
+       double movement_since_remesh = 0.0;
         //TODO timestepping loop
         while(true){
            if ((step >= nsteps and nsteps >= 0) || time >= t_end || halt ){break;}
-            auto id_s = Cabana::slice<id>(particle_aosoa);
-            auto weight_s = Cabana::slice<weight>(particle_aosoa);
-            auto mass_s = Cabana::slice<mass>(particle_aosoa);
-            auto charge_s = Cabana::slice<charge>(particle_aosoa);
-            auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa);
-            auto part_p_s = Cabana::slice<part_p>(particle_aosoa);
-            auto rank_slice = Cabana::slice<rank>(particle_aosoa);
+//           if(myrank == 0) printf("Starting step %i\n", step);
+            auto id_s = Cabana::slice<id>(particle_aosoa, "id");
+            auto weight_s = Cabana::slice<weight>(particle_aosoa, "weight");
+            auto mass_s = Cabana::slice<mass>(particle_aosoa, "mass");
+            auto charge_s = Cabana::slice<charge>(particle_aosoa, "charge");
+            auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "part_pos");
+            auto part_p_s = Cabana::slice<part_p>(particle_aosoa, "part_p");
+            auto rank_slice = Cabana::slice<rank>(particle_aosoa, "rank");
+            auto last_pos_slice = Cabana::slice<last_pos>(particle_aosoa, "last_pos");
             Cabana::SimdPolicy<VectorLength, ExecutionSpace> simd_policy( 0,
                                                       particle_aosoa.size());
-            particle_bcs_functor<decltype(part_pos_s), decltype(rank_slice)> pbf(box, part_pos_s, rank_slice);
+//            particle_bcs_functor<decltype(part_pos_s), decltype(rank_slice)> pbf(box, part_pos_s, rank_slice);
+            kokkos_particle_bcs_functor<decltype(part_pos_s), decltype(rank_slice), decltype(last_pos_slice)> pbf(box, part_pos_s, rank_slice, last_pos_slice, host_field(0).x_min_local, host_field(0).x_max_local);
 
             push_particles_functor<decltype(id_s), decltype(weight_s), decltype(mass_s),
                                    decltype(charge_s), decltype(part_pos_s), decltype(part_p_s)> 
@@ -2135,7 +2761,7 @@ int main(int argc, char* argv[] ){
                                                       dt, dx, config, nxglobal, ng, jng );
            bool push = (time >= particle_push_start_time);
            field_solve_start = timer.seconds();
-           update_eb_fields_half(config.ex, config.ey, config.ez, nxglobal, config.jx, config.jy, config.jz, 
+           update_eb_fields_half(config.ex, config.ey, config.ez, nxlocal, config.jx, config.jy, config.jz, 
                    config.bx, config.by, config.bz,
                    dt, dx, host_field, config.field, ng, update_e_field, update_b_field, rangepolicy);
            field_solve_end = timer.seconds();
@@ -2150,19 +2776,43 @@ int main(int argc, char* argv[] ){
                 particle_start = timer.seconds();
                 Cabana::simd_parallel_for(simd_policy, push_particles, "push_particles");
                 Kokkos::fence();
+                Kokkos::Experimental::contribute(config.jx, config.scatter_jx);
+                Kokkos::Experimental::contribute(config.jy, config.scatter_jy);
+                Kokkos::Experimental::contribute(config.jz, config.scatter_jz);
+                config.scatter_jx.reset();
+                config.scatter_jy.reset();
+                config.scatter_jz.reset();
                 //Call bcs
-                Cabana::simd_parallel_for( simd_policy, pbf, "part_boundary_cond");
+//                Cabana::simd_parallel_for( simd_policy, pbf, "part_boundary_cond");
+                double max_move = 0.0;
+                Kokkos::parallel_reduce("part_boundary_condition", particle_aosoa.size(), pbf, Kokkos::Max<double>(max_move));
+                movement_since_remesh += max_move;
+
                 Kokkos::fence();
                 particle_end = timer.seconds();
                 particle_push_time += (particle_end - particle_start);
                 {
                    //Migration
-                   //Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
-                   //Cabana::migrate( distributor, particle_aosoa );
+#ifdef CABANA_MPI
+                   Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
+                   Cabana::migrate( distributor, particle_aosoa );
                    //exchange_data<decltype(particle_aosoa)>( particle_aosoa, neighbors, myrank, particle_aosoa.size());
+#else
                    if(nranks > 1){
                     migrator.exchange_data( particle_aosoa, neighbors, myrank, particle_aosoa.size());
                    }
+#endif
+                    #ifndef NDEBUG
+                    for(int i = 0 ; i < particle_aosoa.size(); i++){
+                        auto part = particle_aosoa.getTuple(i);
+                        double pos = Cabana::get<part_pos>(part,0);
+                        if(pos < host_field(0).x_min_local){
+                            std::cout << "[" << myrank << "]" << "found bad part " << pos << " < " << host_field(0).x_min_local << "\n" << std::flush;
+                        }
+                        assert(pos >= host_field(0).x_min_local);
+                        assert(pos <= host_field(0).x_max_local);
+                    }
+                    #endif
 //                   MPI_Allreduce(MPI_IN_PLACE, config.jx.data(), nxglobal, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 //                   MPI_Allreduce(MPI_IN_PLACE, config.jy.data(), nxglobal, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 //                   MPI_Allreduce(MPI_IN_PLACE, config.jz.data(), nxglobal, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -2174,6 +2824,16 @@ int main(int argc, char* argv[] ){
                 field_solve_time += (field_solve_end - field_solve_start);
             }
            //  check_for_stop_condition()TODO
+                if(movement_since_remesh > dx*9.0){ //TEST sorting
+                    auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "part_pos");
+                    double grid_min[3] = {x_min_local - dx, 0.0, 0.0};
+                    double grid_max[3] = {x_max_local + dx, 0.01, 0.01};
+                    double grid_delta[3] = {dx*10.0, 0.01, 0.01};
+                    Cabana::LinkedCellList<DeviceType> cell_list( part_pos_s, grid_delta, grid_min, grid_max);
+                    Cabana::permute(cell_list, particle_aosoa);
+                    movement_since_remesh = 0.0;
+                    std::cout << "Remesh at step " << step << "\n";
+                }
            if(halt) break;
            step = step + 1;
            time = time + dt / 2.0;
@@ -2189,9 +2849,15 @@ int main(int argc, char* argv[] ){
                 Kokkos::deep_copy(host_jy, config.jy);
                 host_particle_aosoa.resize(particle_aosoa.size());
                 Cabana::deep_copy(host_particle_aosoa, particle_aosoa);
-                output_routines(host_particle_aosoa, host_ex, host_ey, host_ez,
+                if(nranks > 1){
+                    parallel_output_routine(host_particle_aosoa, host_ex, host_ey, host_ez,
+                     host_bx, host_by, host_bz, host_jx, host_jy, host_jz,
+                     dump_count, nxlocal, nxglobal, ng, jng, config, myrank, nranks);
+                }else{
+                    output_routines(host_particle_aosoa, host_ex, host_ey, host_ez,
                                 host_bx, host_by, host_bz, host_jx, host_jy, host_jz,
                                 dump_count, nxlocal, ng, jng);
+                }
                std::cout << "Dump " << dump_count << " after " << timer.seconds() << " seconds.\n";
                //TODO output_routines
                next_dump += per_dump;
@@ -2199,7 +2865,7 @@ int main(int argc, char* argv[] ){
            }
            time = time + dt / 2.0;
            field_solve_start = timer.seconds();
-           update_eb_fields_final(config.ex, config.ey, config.ez, nxglobal, config.jx, config.jy, config.jz, 
+           update_eb_fields_final(config.ex, config.ey, config.ez, nxlocal, config.jx, config.jy, config.jz, 
                                   config.bx, config.by, config.bz, dt, dx, host_field, config.field, ng,
                                   update_e_field, update_b_field, rangepolicy);
            field_solve_end = timer.seconds();
@@ -2207,9 +2873,29 @@ int main(int argc, char* argv[] ){
 //           std::cout << "step " << step << ": " << jy(241) << ", " << jz(241) << ", " << by(241) << ", " << ey(241) << ", " << ez(241) << "\n";
         }
 
-    std::cout << "Finishing after " << timer.seconds() << " seconds.\n";
-    std::cout << "Field solver time is " << field_solve_time << " seconds.\n";
-    std::cout << "Particle push time is " << particle_push_time << " seconds.\n";
+    std::cout << "Finishing after " << timer.seconds() << " seconds.\n"<< std::flush;
+    std::cout << "Field solver time is " << field_solve_time << " seconds.\n"<< std::flush;
+    std::cout << "Particle push time is " << particle_push_time << " seconds.\n"<< std::flush;
+    std::cout << "max movement is " << movement_since_remesh << "\n" << std::flush;
+    Kokkos::deep_copy(host_ex, config.ex);
+    Kokkos::deep_copy(host_ey, config.ey);
+    Kokkos::deep_copy(host_ez, config.ez);
+    Kokkos::deep_copy(host_bx, config.bx);
+    Kokkos::deep_copy(host_by, config.by);
+    Kokkos::deep_copy(host_bz, config.bz);
+    Kokkos::deep_copy(host_jx, config.jx);
+    Kokkos::deep_copy(host_jy, config.jy);
+    host_particle_aosoa.resize(particle_aosoa.size());
+    Cabana::deep_copy(host_particle_aosoa, particle_aosoa);
+    if(nranks > 1){
+        parallel_output_routine(host_particle_aosoa, host_ex, host_ey, host_ez,
+         host_bx, host_by, host_bz, host_jx, host_jy, host_jz,
+         dump_count, nxlocal, nxglobal, ng, jng, config, myrank, nranks);
+    }else{
+        output_routines(host_particle_aosoa, host_ex, host_ey, host_ez,
+                    host_bx, host_by, host_bz, host_jx, host_jy, host_jz,
+                    dump_count, nxlocal, ng, jng);
+    }
     }//End of Kokkos region
     //Kokkos::finalize();
     MPI_Finalize();
