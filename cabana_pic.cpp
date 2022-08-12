@@ -798,6 +798,24 @@ struct particle_bcs_functor{
 
 };
 
+template<class PartPosSlice, class LastPosSlice>
+struct store_lastpos_functor{
+
+    PartPosSlice _part_pos;
+    LastPosSlice _last_pos;
+
+    KOKKOS_INLINE_FUNCTION
+    store_lastpos_functor(PartPosSlice part_poss, LastPosSlice last_pos_s):
+    _part_pos(part_poss), _last_pos(last_pos_s){
+
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void operator()(const int ix, const int ij) const{
+        _last_pos.access(ix, ij, 0) = _part_pos.access(ix, ij,0);
+    }
+};
+
 template<class PartPosSlice, class RankSlice, class LastPosSlice>
 struct kokkos_particle_bcs_functor{
     boundary _box;
@@ -808,6 +826,7 @@ struct kokkos_particle_bcs_functor{
     int _nranks;
     double _x_min_local;
     double _x_max_local;
+    double _full_local;
 
     KOKKOS_INLINE_FUNCTION
     kokkos_particle_bcs_functor(boundary box, PartPosSlice part_poss, RankSlice rank, LastPosSlice last_pos_s,
@@ -819,8 +838,12 @@ struct kokkos_particle_bcs_functor{
         MPI_Comm_size( MPI_COMM_WORLD, &_nranks );
         _box.x_max = box.x_max;
         _box.x_min = box.x_min;
+        _full_local = (x_max_local - x_min_local);
+        // For a single rank we half this to support periodicity correctly.
+        if(_nranks == 1){_full_local = _full_local / 2.0;}
     }
 
+    KOKKOS_INLINE_FUNCTION
     void operator()(const int i, double &lmax) const{
         if( _part_pos(i, 0) < _x_min_local){
             int rank = _myrank - 1;
@@ -833,14 +856,16 @@ struct kokkos_particle_bcs_functor{
             _rank(i) = rank;
         }
         double movement = fabs(_part_pos(i, 0) - _last_pos(i,0));
-        lmax = movement;
+        if (movement > _full_local) movement = 0.0;
+    //    lmax = fmaxf(lmax, movement);
+        if(movement > lmax) lmax = movement;
         if(_part_pos(i, 0) >= _box.x_max){
             _part_pos(i, 0) -= (_box.x_max - _box.x_min);
         }
         if(_part_pos(i, 0) < _box.x_min){
             _part_pos(i, 0) += (_box.x_max - _box.x_min);
         }
-        _last_pos(i, 0) = _part_pos(i, 0);
+//        _last_pos(i, 0) = _part_pos(i, 0);
 
         //Compute rank for this particle to go to.
 //        double size = _box.x_max - _box.x_min;
@@ -1959,7 +1984,7 @@ template<class aosoa> class Migrator{
             pz_space = Kokkos::View<double**, MemorySpace>("temp_pz", nr_neighbours, buffer_size);
         }
 
-        void exchange_data( aosoa &particle_aosoa, std::vector<int> neighbors, int myrank, int npart){
+        void exchange_data( aosoa &particle_aosoa, std::vector<int> neighbors, int myrank, int npart, double sorting_size, double max_movement, double region_min, double region_max){
 
             auto rank_slice = Cabana::slice<rank>(particle_aosoa, "rank");
  //          Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
@@ -1984,6 +2009,7 @@ template<class aosoa> class Migrator{
              int *send_count = (int*) malloc(sizeof(int) * neighbors.size());
 //             int *send_pos = (int*) malloc(sizeof(int) * neighbors.size());
              int count_neighbours = 0;
+             double midpoint = (region_max - region_min) / 2.0;
              // Need to find a way to make this parallel
              // Ideally atomic free & parallel...
              // First easy thing to do is have one buffer per
@@ -2026,6 +2052,63 @@ template<class aosoa> class Migrator{
              for(int i = 0; i < neighbors.size(); i++){
                 send_count[i] = 0;
              }
+
+             //Go from end backwards to find any particles first
+             for(int i = particle_aosoa.size()-1; i >= 0; i--){
+                if(rank_slice(i) != myrank && rank_slice(i) >= 0){
+                    int therank = rank_slice(i);
+                    for(int k = 0; k < neighbors.size(); k++){
+                        if(therank == neighbors[k]){
+                            therank = k;
+                            break;
+                        }
+                    }
+                    int pos = send_count[therank];
+#ifndef NDEBUG
+                    assert(pos < _buffer_size);
+#endif
+                    id_space(therank, pos) = id_s(i);
+                    weight_space(therank, pos) = weight_s(i);
+                    mass_space(therank, pos) = mass_s(i);
+                    charge_space(therank, pos) = charge_s(i);
+                    pos_space(therank, pos) = part_pos_s(i, 0);
+                    px_space(therank, pos) = part_p_s(i, 0);
+                    py_space(therank, pos) = part_p_s(i, 1);
+                    pz_space(therank, pos) = part_p_s(i, 2);
+                    send_count[therank]++;
+
+                    //Move from end
+                    while(rank_slice(end) != myrank && end > 0){
+                        end--;
+                    }
+                    if(end > i){
+                        //Copy from end
+                        rank_slice(i) = rank_slice(end);
+                        id_s(i) = id_s(end);
+                        weight_s(i) = weight_s(end);
+                        mass_s(i) = mass_s(end);
+                        charge_s(i) = charge_s(end);
+                        part_pos_s(i,0) = part_pos_s(end, 0);
+                        part_p_s(i, 0) = part_p_s(end, 0);
+                        part_p_s(i, 1) = part_p_s(end, 1);
+                        part_p_s(i, 2) = part_p_s(end, 2);
+                        last_pos_s(i, 0) = last_pos_s(end, 0);
+                        rank_slice(end) = -1;
+                    }else{
+                        rank_slice(i) = -1;
+                        end++;
+                    }
+                    continue;
+                }
+
+                // If we've moved too far from the boundary we can stop.
+                if( i < end && (part_pos_s(i, 0) < (region_max - ( 2.0 * max_movement + sorting_size))) &&
+                    (part_pos_s(i, 0) > (region_min + (2.0 * max_movement + 2.0*sorting_size)))){
+                        break;
+                    }
+             }
+
+
              for(int i = 0; i < particle_aosoa.size(); i++){
                 if(rank_slice(i) != myrank && rank_slice(i) >= 0){
                     int therank = rank_slice(i);
@@ -2070,8 +2153,25 @@ template<class aosoa> class Migrator{
                         rank_slice(i) = -1;
                         end++;
                     }
+                    continue;
                 }   
-             } 
+                // If we've moved too far from the boundary we can stop.
+                if( i < end &&  (part_pos_s(i, 0) < (region_max - (2.0 * max_movement + sorting_size))) &&
+                    (part_pos_s(i, 0) > (region_min + (2.0 * max_movement + sorting_size)))){
+                        /*if(myrank == 2){
+                            printf("Exiting 2nd loop at index %i position %f > %f - lastpos %f\n", i, part_pos_s(i, 0), region_min + (2.0 * max_movement + sorting_size), last_pos_s(i, 0));
+                        }*/
+                        break;
+                    }
+             }
+#ifndef NDEBUG
+            for(int i = 0; i < particle_aosoa.size(); i++){
+                if(rank_slice(i) != myrank && rank_slice(i) != -1){
+                    printf("[%i] found a particle at index %i after they should be removed with rank %i\n Its position is %f from %f with max movement %f search radius %f %f\n", myrank, i, rank_slice(i), part_pos_s(i, 0), last_pos_s(i, 0), max_movement, 2.0 * max_movement + sorting_size, sorting_size);
+                }
+                assert( rank_slice(i) == myrank || rank_slice(i) == -1);
+            }
+#endif 
 //             for(int i = 0; i < neighbors.size(); i++){
 //                send_pos[i] = count_neighbours;
 //                int neighbour = neighbors[i];
@@ -2255,6 +2355,12 @@ template<class aosoa> class Migrator{
                      new_part_p_s(end+x,1) = r_py_space(j,i);
                      new_part_p_s(end+x,2) = r_pz_space(j,i);
                      new_rank_slice(end+x) = myrank;
+//                     if(new_part_pos_s(end+x, 0) < midpoint){
+//                        new_last_pos_s(end+x, 0) = region_min;
+//                        printf("distance from region_min is %f, max movement is %f\n position is %f, min is %f, midpoint %f", new_last_pos_s(end+x, 0) - new_part_pos_s(end+x, 0),  max_movement, new_part_pos_s(end+x, 0), region_min, midpoint);
+//                     }else{
+//                        new_last_pos_s(end+x, 0) = region_max;
+//                     }
                      new_last_pos_s(end+x, 0) = new_part_pos_s(end+x,0);
                      x++;
                 }
@@ -2277,13 +2383,16 @@ template<class aosoa> class Migrator{
             assert(new_mass_s(i) > 0);
             assert(new_charge_s(i) != 0);
             assert(new_weight_s(i) > 0);
+            if(new_rank_slice(i) != myrank){
+                printf("[%i] has particle of rank %i\n", myrank, new_rank_slice(i));
+            }
             assert(new_rank_slice(i) == myrank);
             if(new_part_p_s(i, 1) >= 1.0 || new_part_p_s(i, 1) <=-1.0){
                 printf("[%i] y_momentum of %e at index %i\n", myrank, new_part_p_s(i,1), i);
             }
             assert(new_part_p_s(i, 1) < 1.0);
             assert(new_part_p_s(i, 1) >-1.0);
-            assert(new_part_pos_s(i,0) == new_last_pos_s(i,0));
+//            assert(new_part_pos_s(i,0) == new_last_pos_s(i,0));
         }
 #endif
            
@@ -2510,7 +2619,6 @@ int main(int argc, char* argv[] ){
         }
         //TODO output_routines(pic_system, ex, ey, ez, bx, by, bz, jx, jy, jz, dump_count, nxglobal);
         dump_count++;
-
         
 
         //Create the functors and other stuff
@@ -2524,11 +2632,17 @@ int main(int argc, char* argv[] ){
         //Test sorting
         {
             auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "part_pos");
-            double grid_min[3] = {x_min_local - dx, 0.0, 0.0};
-            double grid_max[3] = {x_max_local + dx, 0.01, 0.01};
+            auto last_pos_s = Cabana::slice<last_pos>(particle_aosoa, "last_pos");
+            double grid_min[3] = {host_field(0).x_min_local - dx, 0.0, 0.0};
+            double grid_max[3] = {host_field(0).x_max_local + dx, 0.01, 0.01};
             double grid_delta[3] = {dx*10.0, 0.01, 0.01};
             Cabana::LinkedCellList<DeviceType> cell_list( part_pos_s, grid_delta, grid_min, grid_max);
             Cabana::permute(cell_list, particle_aosoa);
+
+            store_lastpos_functor<decltype(part_pos_s), decltype(last_pos_s)> slf(part_pos_s, last_pos_s);
+            Cabana::SimdPolicy<VectorLength, ExecutionSpace> simd_policy( 0,
+                                                       particle_aosoa.size());
+            Cabana::simd_parallel_for(simd_policy, slf, "store lastpos");
         }
 
 //        Kokkos::RangePolicy<> rangepolicy(ng, nxglobal+ng+1);
@@ -2554,11 +2668,13 @@ int main(int argc, char* argv[] ){
        {
 #ifndef CABANA_MPI
            if(nranks > 1){
-           migrator.exchange_data( particle_aosoa, neighbors, myrank, particle_aosoa.size());
+           migrator.exchange_data( particle_aosoa, neighbors, myrank, particle_aosoa.size(), 10.*dx, 10.*dx, host_field(0).x_min_local, host_field(0).x_max_local);
            }
 #else           
             kokkos_particle_bcs_functor<decltype(part_pos_s), decltype(rank_slice), decltype(last_pos_slice)> pbf(box, part_pos_s, rank_slice, last_pos_slice, host_field(0).x_min_local, host_field(0).x_max_local);
-            Kokkos::parallel_reduce("part_boundary_condition", particle_aosoa.size(), pbf, Kokkos::Max<double>(max_move));
+           double movement = 0.;
+            Kokkos::parallel_reduce("part_boundary_condition", particle_aosoa.size(), pbf, movement);
+            Kokkos::fence();
            auto rank_slice = Cabana::slice<rank>(particle_aosoa);
            Cabana::Distributor<DeviceType> distributor( MPI_COMM_WORLD, rank_slice, neighbors);
            //Initial migration
@@ -2735,13 +2851,22 @@ int main(int argc, char* argv[] ){
        double field_solve_end;
        double particle_start;
        double particle_end;
+       double communication_time = 0.0;
+       double communication_start;
+       double communication_end;
+       double sort_time = 0.0;
+       double sort_start;
+       double sort_end;
+
+       double io_time = 0.0;
+       double io_start;
+       double io_end;
 
        //Store the movement since the last remesh operation
        double movement_since_remesh = 0.0;
         //TODO timestepping loop
         while(true){
            if ((step >= nsteps and nsteps >= 0) || time >= t_end || halt ){break;}
-//           if(myrank == 0) printf("Starting step %i\n", step);
             auto id_s = Cabana::slice<id>(particle_aosoa, "id");
             auto weight_s = Cabana::slice<weight>(particle_aosoa, "weight");
             auto mass_s = Cabana::slice<mass>(particle_aosoa, "mass");
@@ -2786,9 +2911,8 @@ int main(int argc, char* argv[] ){
 //                Cabana::simd_parallel_for( simd_policy, pbf, "part_boundary_cond");
                 double max_move = 0.0;
                 Kokkos::parallel_reduce("part_boundary_condition", particle_aosoa.size(), pbf, Kokkos::Max<double>(max_move));
-                movement_since_remesh += max_move;
-
                 Kokkos::fence();
+                movement_since_remesh = max_move;
                 particle_end = timer.seconds();
                 particle_push_time += (particle_end - particle_start);
                 {
@@ -2799,7 +2923,10 @@ int main(int argc, char* argv[] ){
                    //exchange_data<decltype(particle_aosoa)>( particle_aosoa, neighbors, myrank, particle_aosoa.size());
 #else
                    if(nranks > 1){
-                    migrator.exchange_data( particle_aosoa, neighbors, myrank, particle_aosoa.size());
+                    communication_start = timer.seconds();
+                    migrator.exchange_data( particle_aosoa, neighbors, myrank, particle_aosoa.size(), dx*10.0, movement_since_remesh, host_field(0).x_min_local, host_field(0).x_max_local);
+                    communication_end = timer.seconds();
+                    communication_time += (communication_end - communication_start);
                    }
 #endif
                     #ifndef NDEBUG
@@ -2825,19 +2952,26 @@ int main(int argc, char* argv[] ){
             }
            //  check_for_stop_condition()TODO
                 if(movement_since_remesh > dx*9.0){ //TEST sorting
+                    sort_start = timer.seconds();
                     auto part_pos_s = Cabana::slice<part_pos>(particle_aosoa, "part_pos");
+                    auto last_pos_s = Cabana::slice<last_pos>(particle_aosoa, "last_pos");
                     double grid_min[3] = {x_min_local - dx, 0.0, 0.0};
                     double grid_max[3] = {x_max_local + dx, 0.01, 0.01};
                     double grid_delta[3] = {dx*10.0, 0.01, 0.01};
                     Cabana::LinkedCellList<DeviceType> cell_list( part_pos_s, grid_delta, grid_min, grid_max);
                     Cabana::permute(cell_list, particle_aosoa);
+                    std::cout << "Remesh at step " << step << " with movement " << movement_since_remesh << "\n";
                     movement_since_remesh = 0.0;
-                    std::cout << "Remesh at step " << step << "\n";
+                    store_lastpos_functor<decltype(part_pos_s), decltype(last_pos_s)> slf(part_pos_s, last_pos_s);
+                    Cabana::simd_parallel_for(simd_policy, slf, "store lastpos");
+                    sort_end = timer.seconds();
+                    sort_time += (sort_end - sort_start);
                 }
            if(halt) break;
            step = step + 1;
            time = time + dt / 2.0;
            if(time > next_dump){
+                io_start = timer.seconds();
                 //Deep copy to host fields
                 Kokkos::deep_copy(host_ex, config.ex);
                 Kokkos::deep_copy(host_ey, config.ey);
@@ -2862,6 +2996,8 @@ int main(int argc, char* argv[] ){
                //TODO output_routines
                next_dump += per_dump;
                dump_count++;
+               io_end = timer.seconds();
+               io_time += (io_end - io_start);
            }
            time = time + dt / 2.0;
            field_solve_start = timer.seconds();
@@ -2872,11 +3008,15 @@ int main(int argc, char* argv[] ){
            field_solve_time += (field_solve_end - field_solve_start);
 //           std::cout << "step " << step << ": " << jy(241) << ", " << jz(241) << ", " << by(241) << ", " << ey(241) << ", " << ez(241) << "\n";
         }
-
+    double finish_time = timer.seconds();
     std::cout << "Finishing after " << timer.seconds() << " seconds.\n"<< std::flush;
     std::cout << "Field solver time is " << field_solve_time << " seconds.\n"<< std::flush;
     std::cout << "Particle push time is " << particle_push_time << " seconds.\n"<< std::flush;
     std::cout << "max movement is " << movement_since_remesh << "\n" << std::flush;
+    MPI_Barrier(MPI_COMM_WORLD);
+    if(myrank == 0){
+        printf("End: %f - solver %f - push %f - comm %f - sort %f - io %f\n", finish_time, field_solve_time, particle_push_time, communication_time, sort_time, io_time);
+    }
     Kokkos::deep_copy(host_ex, config.ex);
     Kokkos::deep_copy(host_ey, config.ey);
     Kokkos::deep_copy(host_ez, config.ez);
