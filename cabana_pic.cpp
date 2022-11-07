@@ -1521,6 +1521,7 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
     hid_t acc_template = H5Pcreate(H5P_FILE_ACCESS);
     MPI_Info info; MPI_Info_create(&info);
     H5Pset_fapl_mpio(acc_template, MPI_COMM_WORLD, info);
+    H5Pset_coll_metadata_write(acc_template, 1); //metadata writes are collective
     hid_t file_id = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, acc_template);
 
     if(file_id < 0){
@@ -1531,6 +1532,8 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
     h_dims[0] = particle_aosoa.size();
 
     int my_offset = 0;
+//    Kokkos::Timer timer;
+//    double start = timer.seconds();
     if(myrank == 0 && nranks > 1){
         int npart = particle_aosoa.size();
         MPI_Send(&npart, 1, MPI_INT, 1, 0, MPI_COMM_WORLD);
@@ -1541,6 +1544,16 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
         int npart = my_offset + particle_aosoa.size();
         MPI_Send(&npart, 1, MPI_INT, myrank+1, 0, MPI_COMM_WORLD);
     }
+//    double end = timer.seconds();
+//    if(myrank == 0){
+//        printf("Took %f seconds to send offsets.\n", end-start);
+//    }
+
+    hid_t xf_id = H5Pcreate(H5P_DATASET_XFER);
+    H5Pset_dxpl_mpio(xf_id, H5FD_MPIO_COLLECTIVE);
+    /*hsize_t chunks[1];
+    chunks[0] = 1048576/8;
+    H5Pset_chunk(xf_id,1,chunks);*/
 
     int global_part_count = 0;
     MPI_Allreduce( &h_dims[0], &global_part_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -1569,7 +1582,7 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
         double pos = Cabana::get<part_pos>(part,0);
         temp[i] = pos;
     }
-    H5Dwrite(positions, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(positions, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(positions);
 
     hid_t Px = H5Dcreate2(file_id, "Particles_Px", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -1578,7 +1591,7 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
         double pos = Cabana::get<part_p>(part,0);
         temp[i] = pos;
     }
-    H5Dwrite(Px, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Px, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Px);
         
     hid_t Py = H5Dcreate2(file_id, "Particles_Py", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -1587,7 +1600,7 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
         double pos = Cabana::get<part_p>(part,1);
         temp[i] = pos;
     }
-    H5Dwrite(Py, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Py, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Py);
 
     hid_t Pz = H5Dcreate2(file_id, "Particles_Pz", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -1596,7 +1609,7 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
         double pos = Cabana::get<part_p>(part,2);
         temp[i] = pos;
     }
-    H5Dwrite(Pz, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Pz, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Pz);
 
     hid_t pmass = H5Dcreate2(file_id, "Particles_mass", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -1604,7 +1617,7 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
         auto part = particle_aosoa.getTuple(i);
         temp[i] = Cabana::get<mass>(part);
     }
-    H5Dwrite(pmass, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(pmass, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(pmass);
 
     free(temp);
@@ -1645,63 +1658,63 @@ void parallel_output_routine(Cabana::AoSoA<DataTypes, HostType, VectorLength> pa
     for(int i = 0; i < grid_size; i++){
         temp[i] = ex(i+ng);
     }
-    H5Dwrite(Electric_Field_Ex, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Electric_Field_Ex, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Electric_Field_Ex);
 
     hid_t Electric_Field_Ey = H5Dcreate2(file_id, "Electric_Field_Ey", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = ey(i+ng);
     }
-    H5Dwrite(Electric_Field_Ey, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Electric_Field_Ey, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Electric_Field_Ey);
 
     hid_t Electric_Field_Ez = H5Dcreate2(file_id, "Electric_Field_Ez", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = ez(i+ng);
     }
-    H5Dwrite(Electric_Field_Ez, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Electric_Field_Ez, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Electric_Field_Ez);
 
     hid_t Magnetic_Field_Bx = H5Dcreate2(file_id, "Magnetic_Field_Bx", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = bx(i+ng);
     }
-    H5Dwrite(Magnetic_Field_Bx, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Magnetic_Field_Bx, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Magnetic_Field_Bx);
 
     hid_t Magnetic_Field_By = H5Dcreate2(file_id, "Magnetic_Field_By", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = by(i+ng);
     }
-    H5Dwrite(Magnetic_Field_By, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Magnetic_Field_By, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Magnetic_Field_By);
 
     hid_t Magnetic_Field_Bz = H5Dcreate2(file_id, "Magnetic_Field_Bz", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = bz(i+ng);
     }
-    H5Dwrite(Magnetic_Field_Bz, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Magnetic_Field_Bz, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Magnetic_Field_Bz);
 
     hid_t Current_Jx = H5Dcreate2(file_id, "Current_Jx", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = jx(i+ng);
     }
-    H5Dwrite(Current_Jx, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Current_Jx, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Current_Jx);
 
     hid_t Current_Jy = H5Dcreate2(file_id, "Current_Jy", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = jy(i+ng);
     }
-    H5Dwrite(Current_Jy, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Current_Jy, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Current_Jy);
 
     hid_t Current_Jz = H5Dcreate2(file_id, "Current_Jz", H5T_NATIVE_DOUBLE, global_dim, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     for(int i = 0; i < grid_size; i++){
         temp[i] = jz(i+ng);
     }
-    H5Dwrite(Current_Jz, H5T_NATIVE_DOUBLE, memspace, global_dim, H5P_DEFAULT, temp);
+    H5Dwrite(Current_Jz, H5T_NATIVE_DOUBLE, memspace, global_dim, xf_id, temp);
     H5Dclose(Current_Jz);
 
     free(temp);
